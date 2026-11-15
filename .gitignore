@@ -1,0 +1,50 @@
+# 构建输出
+build/
+Debug/
+Release/
+x64/
+x86/
+cmake-build-*/
+
+# IDE
+.vscode/
+.vs/
+*.user
+*.suo
+*.ncb
+*.sdf
+*.opensdf
+*.ipch/
+*.tlog
+
+# 编译中间文件
+*.obj
+*.o
+*.lib
+*.a
+*.pdb
+*.exp
+*.ilk
+*.tlog
+*.gcda
+*.gcno
+*.gcov
+
+# 可执行/动态库
+*.exe
+*.dll
+*.so
+*.dylib
+*.out
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+
+# 数据文件
+*.sav
+
+# 系统文件
+.DS_Store
+Thumbs.db
