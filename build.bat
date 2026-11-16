@@ -43,11 +43,11 @@ if errorlevel 1 goto fail
 
 rem ---------- 2. 模组（有 .c 才编译，方便单独加模组） ----------
 echo [2/3] mods
-for %%M in (Core Ach Story Minigame Events Activity Care World Debug) do (
-    if exist mods\src\%%M.c (
-        cl /nologo /utf-8 /W4 /Imods\incl /Fo:build\mods\%%M.obj /Fd:build\mods\%%M.pdb /LD mods\src\%%M.c /Fe:mods\%%M.dll
+if exist "mods\src" (
+    for /r "mods\src" %%F in (*.c) do (
+        cl /nologo /utf-8 /W4 /Imods\incl /Fo:"build\mods\%%~nF.obj" /Fd:"build\mods\%%~nF.pdb" /LD "%%~fF" /Fe:"mods\%%~nF.dll"
         if errorlevel 1 goto fail
-        echo     mods\%%M.dll
+        echo     mods\%%~nF.dll
     )
 )
 
