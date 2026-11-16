@@ -527,6 +527,7 @@ static int svc_trait_conflict(Id a, Id b);
 
 static int g_has_vt;       /* 控制台支持 ANSI 颜色 */
 static WORD g_console_attr; /* 非 VT 控制台的默认属性（高亮后恢复） */
+static int g_push_key;      /* 流式输出期间先读到的按键：留给下一次 ui_key */
 
 /*
  * 画一行可选项：选中项用“背景色 + 反色”（黑字青底）高亮，不再用 > 箭头。
@@ -572,11 +573,13 @@ static void ui_title(const char *title)
     fflush(stdout);
 }
 
-static void render_text(const char *text); /* 前置声明：普通输出与 dialog 共用同一套文字引擎 */
+/* 前置声明：普通输出与 dialog 共用同一套文字引擎 */
+static void text_engine_run(const char *text, int stream_default);
 
 /*
- * 普通输出也走文字引擎：可以写 §S / §T / §O / §P / §0、{pet}、⌈术语⌋。
- * 没有这些标记的纯文本仍然直接 fputs，输出与以前完全一致（不额外转义、不逐字刷新）。
+ * 普通输出也走文字引擎：可以写 $C / $P / $K / $N / $E / %NAME% 等格式符。
+ * 没有任何格式符的纯文本仍然直接 fputs，输出与以前完全一致（不逐字刷新、不流式）。
+ * 注意：这里的 fmt 走 printf，写 %NAME% 要写成 %%NAME%%（或者直接用 %s 传宠物名）。
  */
 static void ui_print(const char *fmt, ...)
 {
@@ -602,8 +605,8 @@ static void ui_print(const char *fmt, ...)
     vsnprintf(buf, (size_t)need + 1, fmt, args);
     va_end(args);
 
-    if (strstr(buf, "\xC2\xA7") || strstr(buf, "{pet}") || strstr(buf, "\xE2\x8C\x88"))
-        render_text(buf);
+    if (strchr(buf, '$') || strstr(buf, "%NAME%") || strstr(buf, "%TYPE%"))
+        text_engine_run(buf, 0);
     else
         fputs(buf, stdout);
     fflush(stdout);
@@ -754,13 +757,92 @@ static int menu_texts_free(SelectOpt_t *opts, uint64_t count, int ret)
     return ret;
 }
 
-/* 选择菜单（↑↓选择，Z/R确认，X/L返回）；返回选中 value，X 返回 -1 */
-static int ui_menu(const char *header, SelectOpt_t *opts, uint64_t count)
+/* ============ 菜单步骤记录（每层菜单各自记住上次停在哪一项） ============ */
+
+/*
+ * “按步骤记录”：每个菜单各存一条“上次停留的选项下标”，下次进入同一个菜单时
+ * 从这条记录恢复。键用菜单名，所以层数不受限制：
+ *   主菜单   → "menu.@root"
+ *   子菜单   → "menu.<父菜单名>"（菜单 name 全局唯一）
+ *   模组列表 → 直接用 ui_menu 的标题（同一个标题就算同一个步骤）
+ * 于是玩家无论在子菜单里选了选项后自动回到父菜单，还是按 X 一级级退出来，
+ * 每一层都停在原来那一项上；记录只在内存里，重启进程后从第一项重新开始。
+ */
+typedef struct {
+    char *key;    /* 步骤键（堆内存，由 steps_free 释放） */
+    uint64_t sel; /* 上次停留的选项下标 */
+} MenuStep;
+
+static MenuStep *g_steps;
+static uint64_t g_step_n;
+static uint64_t g_step_cap;
+
+#define MENU_STEP_MAX 1024 /* 防呆：模组若拿会变的标题当键，最多记这么多条 */
+
+static MenuStep *step_find(const char *key)
 {
-    uint64_t sel = 0;
+    uint64_t i;
+
+    if (!key || !key[0]) return NULL;
+    for (i = 0; i < g_step_n; i++)
+        if (g_steps[i].key[0] && strcmp(g_steps[i].key, key) == 0) return &g_steps[i];
+    return NULL;
+}
+
+/* 记住某个步骤的停留位置；key 为空表示不记录 */
+static void step_store(const char *key, uint64_t sel)
+{
+    MenuStep *s;
+
+    if (!key || !key[0]) return;
+
+    s = step_find(key);
+    if (!s)
+    {
+        if (g_step_n >= MENU_STEP_MAX) return; /* 只少记一条，不影响玩法 */
+        if (!vec_grow((void **)&g_steps, &g_step_cap, g_step_n + 1, sizeof(*g_steps))) return;
+        s = &g_steps[g_step_n];
+        s->key = err_strdup(key);
+        if (!s->key) return;
+        s->sel = 0;
+        g_step_n++;
+    }
+    s->sel = sel;
+}
+
+/* 取上次停留的位置；列表变短（动态列表）时夹到最后一项 */
+static uint64_t step_load(const char *key, uint64_t count)
+{
+    MenuStep *s = step_find(key);
+
+    if (!s || count == 0) return 0;
+    return (s->sel < count) ? s->sel : count - 1;
+}
+
+static void steps_free(void)
+{
+    uint64_t i;
+
+    for (i = 0; i < g_step_n; i++) free(g_steps[i].key);
+    free(g_steps);
+    g_steps = NULL;
+    g_step_n = g_step_cap = 0;
+}
+
+/*
+ * 选择菜单（↑↓选择，Z/R确认，X/L返回）；返回选中 value，X 返回 -1。
+ * step 非空时按步骤记录：进入时恢复上次停留的项，每次移动都写回去，
+ * 所以选完选项退出、按 X 返回、甚至中途被打断都不会丢位置。
+ * 无头模式不读写记录，保证 --demo/--auto 每次都从第一项开始。
+ */
+static int ui_menu_step(const char *header, const char *step, SelectOpt_t *opts, uint64_t count)
+{
+    uint64_t sel;
 
     if (!opts || count == 0) return -1;
     if (g_headless) return menu_texts_free(opts, count, opts[0].value);
+
+    sel = step_load(step, count);
 
     while (1)
     {
@@ -795,6 +877,7 @@ static int ui_menu(const char *header, SelectOpt_t *opts, uint64_t count)
         fflush(stdout);
 
         {
+            uint64_t before = sel;
             int k = ui_key();
             if (k == KEY_UP) sel = (sel + count - 1) % count;
             else if (k == KEY_DOWN) sel = (sel + 1) % count;
@@ -813,9 +896,17 @@ static int ui_menu(const char *header, SelectOpt_t *opts, uint64_t count)
             }
             else if (k == KEY_OK) return menu_texts_free(opts, count, opts[sel].value);
             else if (k == KEY_CANCEL) return menu_texts_free(opts, count, -1);
+            if (sel != before) step_store(step, sel); /* 每次移动都记，中途退出也不会丢 */
         }
     }
 }
+
+/* 三参数版本：用标题当步骤键，模组的自定义列表也自动记住位置 */
+static int ui_menu(const char *header, SelectOpt_t *opts, uint64_t count)
+{
+    return ui_menu_step(header, header, opts, count);
+}
+
 /* 把一次按键解码成 KEY_*：c2<0 表示普通单键；返回 0 = 未识别 */
 int ml_decode_key(int c1, int c2)
 {
@@ -841,6 +932,7 @@ static int ui_key(void)
 {
     int c;
 
+    if (g_push_key) { int k = g_push_key; g_push_key = 0; return k; }
     if (g_headless) return KEY_OK; /* 自动确认 */
 
     while (1)
@@ -864,19 +956,41 @@ static void ui_delay(uint32_t ms)
     if (!g_headless) Sleep(ms);
 }
 
-/* ============ 统一文字引擎 ============ */
+/* ============ 统一文字引擎（块模型 + $ 格式符） ============ */
 
 /*
- * 控制码（UTF-8 的 § 是 C2 A7，后接一个 ASCII 字符）：
- *   §S 流式输出      §T 术语标识（绿）   §O 讲述人标识（黄）
- *   §0 清除所有格式  §P 宠物名（蓝）     §C 清屏（该页不能用 ← 回来）
- *   §F 翻页（该页可用 ← 回来）
- * 旧语法 {pet} 仍保留（蓝色），⌈术语⌋ 仍保留（绿色）。
+ * 一、块（block）
+ *   文本被切成块，块就是计数单位：
+ *     AAA        → 3 个内容块（每个字符一块）
+ *     $Xas       → 3 个内容块（$X 命令一块、a、s）
+ *     $[aaa$]    → 1 个内容块（里面还有 3 个）
+ *     ${AAAA$}   → 1 个逻辑块（里面 4 个内容块）
+ *   $[ ] 与 ${ } 可以互相嵌套；块模型只在 $A/$W/$F 这类控制块里决定“项目数”。
+ *
+ * 二、格式符（$ 后跟一个 ASCII 字符；大写=开，小写=关）
+ *   $X/$x  流式输出时 X 键跳过（默认开）        $S/$s  流式输出（对话里默认开）
+ *   $K/$k  关键词效果（绿；对话里 C 键查术语）  $N/$n  名字效果（黄）
+ *   $E/$e  吐槽效果（灰斜体）
+ *   $L 逻辑换行：开一条新的逻辑行（$c 的清行边界）；文本里的 \n 只是同一条
+ *      逻辑行里的普通换行，不算逻辑行边界
+ *   $C 清屏    $c 清掉当前整条逻辑行（含它里面的 \n 换行）    $P 等 Z 键    $p!T 等 T 毫秒
+ *   $A!L!L      分支：L1 是选项，选第 i 项后播放 L2 的第 i 项（两块项目数应相等）
+ *   $a!T!L!L    分支（带问题）：先渲染 !T，再同 $A
+ *   $W!L!L      循环：L1 是选项（比 L2 多一项，最后一项=结束），
+ *               选第 i 项就播放 L2 的第 i 项，然后重新出选项
+ *   $w!T!L!L    循环（带问题）：先渲染 !T，再同 $W
+ *   $F!T!L      函数调用：T=函数 id，返回值当 L 的项目下标（超出项目数就取模循环）
+ *   $f!T        函数调用：T=函数 id，返回值当文本插回
+ *   $$ 字面 $    %NAME% 宠物名    %TYPE% 宠物种类
+ *   !T / !L 只是“这里要跟一个内容块 / 逻辑块”的书写说明，不写进文本。
+ *
+ * 三、播放
+ *   没有翻页：pages 依次播放，节奏交给 $C / $P。一页播完如果内容自己没等过键
+ *   （$P / $p / 选项菜单），引擎在页尾补一次 Z 等待，所以没写 $P 的旧文本也会停。
+ *   流式输出每字延时来自配置项 text.stream_ms（配置菜单可改）。
  */
 
-#define TEXT_STREAM_MS 30
-
-/* ---- 当前页面的术语（动态数组） ---- */
+/* ---- 术语表：$K ... $k 里的关键词，C 键查解释 ---- */
 
 static char **g_page_terms;
 static size_t g_page_term_n;
@@ -900,7 +1014,8 @@ static void terms_free(void)
 static int term_add(const char *s, size_t n)
 {
     char *p;
-    if (!s || n == 0 || n >= (size_t)SIZE_MAX) return 0;
+
+    if (!s || n == 0) return 0;
 
     if (g_page_term_n == g_page_term_cap)
     {
@@ -922,6 +1037,7 @@ static int term_add(const char *s, size_t n)
     return 1;
 }
 
+/* 动态字符串缓冲：摊平块、收集关键词都用它 */
 static int strbuf_add(char **buf, size_t *cap, size_t *len, const char *s, size_t n)
 {
     if (n == 0) return 1;
@@ -945,86 +1061,6 @@ static int strbuf_add(char **buf, size_t *cap, size_t *len, const char *s, size_
     return 1;
 }
 
-/* 取一段可见文字（去掉控制码，{pet}/§P 换成人名），作为术语名 */
-static void term_add_visible(const char *s, const char *e)
-{
-    char *buf = NULL;
-    size_t cap = 0, len = 0;
-    const char *p = s;
-
-    while (p < e)
-    {
-        int code = 0;
-        size_t l;
-
-        if (p + 3 <= e && p[0] == '\xC2' && p[1] == '\xA7') code = (unsigned char)p[2];
-        if (code)
-        {
-            if (code == 'P' && g_pet_ctx && g_pet_ctx->name)
-                (void)strbuf_add(&buf, &cap, &len, g_pet_ctx->name, strlen(g_pet_ctx->name));
-            p += 3;
-            continue;
-        }
-        if (p + 5 <= e && strncmp(p, "{pet}", 5) == 0)
-        {
-            const char *name = (g_pet_ctx && g_pet_ctx->name) ? g_pet_ctx->name : "它";
-            (void)strbuf_add(&buf, &cap, &len, name, strlen(name));
-            p += 5;
-            continue;
-        }
-        if (p + 3 <= e && (unsigned char)p[0] == 0xE2 &&
-            (unsigned char)p[1] == 0x8C &&
-            ((unsigned char)p[2] == 0x88 || (unsigned char)p[2] == 0x8B))
-        {
-            p += 3; /* 旧术语括号本身不进入术语名 */
-            continue;
-        }
-        l = 1;
-        if (((unsigned char)p[0] & 0xE0) == 0xC0) l = 2;
-        else if (((unsigned char)p[0] & 0xF0) == 0xE0) l = 3;
-        else if (((unsigned char)p[0] & 0xF8) == 0xF0) l = 4;
-        if (p + l > e) l = 1;
-        (void)strbuf_add(&buf, &cap, &len, p, l);
-        p += l;
-    }
-
-    if (len > 0) term_add(buf, len);
-    free(buf);
-}
-
-/* 扫出当前页的术语：旧 ⌈术语⌋ + §T ... §0 */
-static void collect_terms(const char *text)
-{
-    const char *p = text;
-
-    terms_clear();
-    while (p && *p)
-    {
-        if (p[0] == '\xE2' && p[1] == '\x8C' && p[2] == '\x88') /* ⌈ */
-        {
-            const char *close = strstr(p + 3, "\xE2\x8C\x8B");
-            if (!close) { p += 3; continue; }
-            term_add(p + 3, (size_t)(close - (p + 3)));
-            p = close + 3;
-            continue;
-        }
-        if (p[0] == '\xC2' && p[1] == '\xA7' && p[2] == 'T')
-        {
-            const char *q = p + 3;
-            while (*q)
-            {
-                if (q[0] == '\xC2' && q[1] == '\xA7' && q[2] == '0') break;
-                if (q[0] == '\xC2' && q[1] == '\xA7' && q[2]) { q += 3; continue; }
-                q++;
-            }
-            term_add_visible(p + 3, q);
-            p = q;
-            continue;
-        }
-        p++;
-    }
-}
-
 static void show_terms(void)
 {
     size_t i;
@@ -1037,11 +1073,42 @@ static void show_terms(void)
         if (t && t->desc) ui_print("%s\n", t->desc);
         else ui_print("  (模组没有提供解释)\n");
     }
-    ui_print("\n  X:返回\n");
+    ui_print("\n  Z:返回\n");
     ui_key();
 }
 
-/* ---- 格式化输出 ---- */
+/* ---- 效果（风格）与执行上下文 ---- */
+
+#define TEXT_STYLE_NONE  0 /* 普通 */
+#define TEXT_STYLE_KEY   1 /* 关键词：绿 */
+#define TEXT_STYLE_NAME  2 /* 名字：黄 */
+#define TEXT_STYLE_SNARK 3 /* 吐槽：灰斜体 */
+
+typedef struct {
+    const char *speaker; /* 当前说话人（选项菜单标题用，可空） */
+    uint32_t stream_ms;  /* 流式输出每字延时（text.stream_ms） */
+    int stream;          /* $S/$s：流式输出 */
+    int skip_x;          /* $X/$x：流式输出时 X 键跳过 */
+    int skip_now;        /* 本屏已经按过 X：剩下的字不再延时 */
+    int kw;              /* $K/$k：关键词效果 */
+    int nm;              /* $N/$n：名字效果 */
+    int snk;             /* $E/$e：吐槽效果 */
+    int collect;         /* 1=把 $K 关键词收进术语表（对话页） */
+    int waited;          /* 本页已经等过键：页尾不再补 Z */
+    int color;           /* 已经应用的 ANSI 风格 */
+    uint64_t emitted;    /* 本页输出过多少字节（空页不补等待） */
+    int vis_lines;       /* 当前逻辑行里已经输出过几个 \n（$c 要清几行） */
+    uint32_t depth;      /* 块嵌套深度 */
+    uint32_t ctl;        /* $A/$W/$F 控制嵌套深度 */
+} TextCtx;
+
+static int text_style_now(const TextCtx *c)
+{
+    if (c->kw) return TEXT_STYLE_KEY;
+    if (c->nm) return TEXT_STYLE_NAME;
+    if (c->snk) return TEXT_STYLE_SNARK;
+    return TEXT_STYLE_NONE;
+}
 
 static size_t text_utf8_len(const char *p)
 {
@@ -1053,280 +1120,808 @@ static size_t text_utf8_len(const char *p)
     return 1;
 }
 
-static int text_ctrl(const char *p)
+static const char *text_pet_name(void)
 {
-    if ((unsigned char)p[0] == 0xC2 && (unsigned char)p[1] == 0xA7 && p[2])
-        return (unsigned char)p[2];
-    return 0;
+    return (g_pet_ctx && g_pet_ctx->name) ? g_pet_ctx->name : "它";
 }
 
-static void text_color(int *cur, int want)
+static const char *text_pet_type(void)
 {
-    if (!g_has_vt || *cur == want) return;
-    if (want == 1) printf("\x1B[32m");
-    else if (want == 2) printf("\x1B[33m");
-    else if (want == 3) printf("\x1B[34m");
-    else printf("\x1B[0m");
-    *cur = want;
+    const PetType *t;
+
+    if (!g_pet_ctx) return "伴兽";
+    t = (const PetType *)reg_get(KIND_PET_TYPE, g_pet_ctx->type_id);
+    return (t && t->name) ? t->name : "伴兽";
 }
 
-static void text_emit(const char *s, const char *e, int *color, int want, int stream)
+/* ---- 关键词缓冲：$K ... $k 之间出现的可见文字，结束时作为一条术语 ---- */
+
+static char *g_kw;
+static size_t g_kw_n;
+static size_t g_kw_cap;
+
+static void kw_flush(void)
 {
-    while (s < e)
+    if (g_kw_n > 0) (void)term_add(g_kw ? g_kw : "", g_kw_n);
+    g_kw_n = 0;
+    if (g_kw) g_kw[0] = '\0';
+}
+
+static void kw_add(const char *s, size_t n)
+{
+    if (n == 0) return;
+    (void)strbuf_add(&g_kw, &g_kw_cap, &g_kw_n, s, n);
+}
+
+/* ---- 输出 ---- */
+
+static void text_style(TextCtx *c, int want)
+{
+    if (c->collect && c->color == TEXT_STYLE_KEY && want != TEXT_STYLE_KEY) kw_flush();
+
+    if (!g_has_vt)
     {
-        size_t l = text_utf8_len(s);
-        if (s + l > e) l = 1;
-        text_color(color, want);
-        fwrite(s, 1, l, stdout);
-        if (stream)
-        {
-            fflush(stdout);
-            ui_delay(TEXT_STREAM_MS);
-        }
-        s += l;
+        c->color = want;
+        return;
+    }
+    if (c->color == want) return;
+
+    if (want == TEXT_STYLE_KEY) printf("\x1B[32m");
+    else if (want == TEXT_STYLE_NAME) printf("\x1B[33m");
+    else if (want == TEXT_STYLE_SNARK) printf("\x1B[3;90m");
+    else printf("\x1B[0m");
+    c->color = want;
+}
+
+static void text_poll_skip(TextCtx *c); /* 流式输出期间看一眼有没有按 X */
+
+static void text_put(TextCtx *c, const char *s, size_t n)
+{
+    size_t i;
+
+    if (!s || n == 0) return;
+
+    text_style(c, text_style_now(c));
+    fwrite(s, 1, n, stdout);
+    c->emitted += (uint64_t)n;
+
+    /* 数 \n：这些只是同一逻辑行里的换行，$c 时要一起清掉 */
+    for (i = 0; i < n; i++)
+        if (s[i] == '\n') c->vis_lines++;
+
+    if (c->collect && text_style_now(c) == TEXT_STYLE_KEY) kw_add(s, n);
+
+    if (c->stream && !c->skip_now && c->stream_ms > 0)
+    {
+        fflush(stdout);
+        if (c->skip_x) text_poll_skip(c);
+        ui_delay(c->stream_ms);
     }
 }
 
-/* 输出一页：流式/术语/讲述人/宠物名/旧语法 */
-static void render_text(const char *text)
+static void text_put_str(TextCtx *c, const char *s)
 {
-    const char *p = text;
-    int color = 0, stream = 0, term = 0, narrator = 0;
+    if (s) text_put(c, s, strlen(s));
+}
 
-    if (!text) return;
-    while (*p)
+/* 流式输出时读到的按键：X 跳过本屏，其余键存起来留给后面的 $P / 选项 */
+static void text_poll_skip(TextCtx *c)
+{
+    int c1, k;
+
+    if (g_headless) return;
+    if (!_kbhit()) return;
+
+    c1 = _getch();
+    if (c1 < 0) return;
+    if (c1 == 0 || c1 == 0xE0) k = ml_decode_key(c1, _getch());
+    else k = ml_decode_key(c1, -1);
+
+    if (k == 0) return;
+    if (k == KEY_CANCEL) { c->skip_now = 1; return; }
+    if (!g_push_key) g_push_key = k;
+}
+
+/* ---- 节奏：等待 / 停顿 / 清屏 ---- */
+
+static void text_wait_key(TextCtx *c)
+{
+    c->waited = 1;
+    c->skip_now = 0;
+    c->vis_lines = 0; /* 等键之后算新的一条逻辑行 */
+    if (g_headless) return;
+
+    for (;;)
     {
-        int code = text_ctrl(p);
-        if (code)
+        int k;
+
+        if (g_page_term_n > 0) printf("\n  Z:继续   C:术语\n");
+        else printf("\n  Z:继续\n");
+        fflush(stdout);
+
+        k = ui_key();
+        if (k == KEY_TERM && g_page_term_n > 0) { show_terms(); continue; }
+        if (k == KEY_OK || k == KEY_CANCEL || k == KEY_LEFT || k == KEY_RIGHT) break;
+    }
+    c->skip_now = 0;
+}
+
+static void text_sleep_ms(uint64_t ms)
+{
+    if (g_headless) return;
+    while (ms > 0)
+    {
+        uint32_t chunk = (ms > 1000u) ? 1000u : (uint32_t)ms;
+        Sleep(chunk);
+        ms -= chunk;
+    }
+}
+
+static void text_clear_screen(TextCtx *c)
+{
+    kw_flush();
+    if (c->collect) terms_clear();
+
+    if (!g_headless)
+    {
+        if (g_has_vt) printf("\x1B[0m");
+        fflush(stdout);
+        system("cls");
+        /* 清屏后把说话人标题补回来，否则 $C 会把 ui_title 画的标题擦掉 */
+        if (c->speaker && c->speaker[0]) printf("\n  ── %s ──\n", c->speaker);
+    }
+    c->color = TEXT_STYLE_NONE;
+    c->vis_lines = 0;
+    fflush(stdout);
+}
+
+/* $c：清掉当前整条逻辑行（$L 划出来的那一段，含里面的 \n 断行） */
+static void text_clear_line(TextCtx *c)
+{
+    int i;
+
+    kw_flush();
+    if (g_headless) { c->vis_lines = 0; return; }
+
+    if (g_has_vt)
+    {
+        /* 颜色先复位（擦掉字符不会清掉 SGR 状态），再逐行往上擦 */
+        if (c->color != TEXT_STYLE_NONE) printf("\x1B[0m");
+        /* 从当前视觉行往上退 vis_lines 行，逐行擦干净，光标回到逻辑行开头 */
+        printf("\r");
+        for (i = 0; i <= c->vis_lines; i++)
         {
-            if (code == 'S') stream = 1;
-            else if (code == 'T') { term = 1; narrator = 0; }
-            else if (code == 'O') { narrator = 1; term = 0; }
-            else if (code == '0') { stream = 0; term = 0; narrator = 0; text_color(&color, 0); }
-            else if (code == 'P')
+            printf("\x1B[2K");
+            if (i < c->vis_lines) printf("\x1B[1A\r");
+        }
+        printf("\r");
+    }
+    else
+    {
+        /* 没有 VT 退不上去：只清光标所在的这一视觉行 */
+        printf("\r");
+        for (i = 0; i < 79; i++) putchar(' ');
+        printf("\r");
+    }
+    c->color = TEXT_STYLE_NONE;
+    c->vis_lines = 0;
+    fflush(stdout);
+}
+
+/* ---- 块模型 ---- */
+
+typedef enum {
+    TB_TEXT = 0, /* 一个 UTF-8 字符 */
+    TB_NAME,     /* %NAME% */
+    TB_TYPE,     /* %TYPE% */
+    TB_CMD,      /* $X 命令 */
+    TB_CONTENT,  /* $[ ... $] 内容块 */
+    TB_LOGIC     /* ${ ... $} 逻辑块 */
+} TbKind;
+
+typedef struct Tb Tb;
+struct Tb {
+    uint8_t kind;
+    uint8_t cmd;   /* TB_CMD：$ 后面那个字符（保留大小写） */
+    const char *s; /* TB_TEXT：源串里的这一小段 */
+    uint32_t len;
+    Tb **items;
+    uint32_t n, cap;
+};
+
+#define TB_MAX_DEPTH 64 /* 嵌套深度上限：病态文本不至于把内存吃光 */
+#define TB_CMD_CHARS "XxSsKkNnEeCcPpAaWwFfL"
+
+static Tb *tb_new(uint8_t kind)
+{
+    Tb *b = (Tb *)calloc(1, sizeof(*b));
+    if (b) b->kind = kind;
+    return b;
+}
+
+static int tb_add(Tb *parent, Tb *child)
+{
+    uint64_t cap;
+
+    if (!parent || !child) return 0;
+
+    cap = parent->cap;
+    if (!vec_grow((void **)&parent->items, &cap,
+                  (uint64_t)parent->n + 1u, sizeof(*parent->items)))
+        return 0;
+    parent->cap = (uint32_t)cap;
+    parent->items[parent->n++] = child;
+    return 1;
+}
+
+static void tb_free(Tb *b)
+{
+    uint32_t i;
+
+    if (!b) return;
+    for (i = 0; i < b->n; i++) tb_free(b->items[i]);
+    free(b->items);
+    free(b);
+}
+
+static int tb_text(Tb *parent, const char *s, uint32_t len)
+{
+    Tb *b = tb_new(TB_TEXT);
+
+    if (!b) return 0;
+    b->s = s;
+    b->len = len;
+    if (!tb_add(parent, b)) { tb_free(b); return 0; }
+    return 1;
+}
+
+static int tb_subst(Tb *parent, uint8_t kind)
+{
+    Tb *b = tb_new(kind);
+    if (!b) return 0;
+    if (!tb_add(parent, b)) { tb_free(b); return 0; }
+    return 1;
+}
+
+/* 把一段文本切成块树；未闭合的块在结尾自动补全（不会丢内容） */
+static Tb *tb_parse(const char *src)
+{
+    Tb *root, *cur;
+    Tb *stack[TB_MAX_DEPTH];
+    uint32_t depth = 0;
+    const char *p = src;
+
+    root = tb_new(TB_CONTENT);
+    if (!root) return NULL;
+    cur = root;
+
+    while (p && *p)
+    {
+        if (p[0] == '$')
+        {
+            char c = p[1];
+
+            if (c == '$') /* $$ = 字面 $ */
             {
-                const char *name = (g_pet_ctx && g_pet_ctx->name) ? g_pet_ctx->name : "它";
-                text_emit(name, name + strlen(name), &color, 3, stream);
+                if (!tb_text(cur, p, 1)) break;
+                p += 2;
+                continue;
             }
-            p += 3;
+            if ((c == '[' || c == '{') && depth < TB_MAX_DEPTH)
+            {
+                Tb *g = tb_new((uint8_t)(c == '[' ? TB_CONTENT : TB_LOGIC));
+                if (!g) break;
+                if (!tb_add(cur, g)) { tb_free(g); break; }
+                stack[depth++] = g; /* 栈里放“还没关闭的块”本身 */
+                cur = g;
+                p += 2;
+                continue;
+            }
+            if (c == ']' || c == '}') /* 关闭最近的同类块，里面没关的顺手补全 */
+            {
+                uint8_t want = (uint8_t)((c == ']') ? TB_CONTENT : TB_LOGIC);
+                uint32_t d, found = depth;
+
+                for (d = depth; d > 0; d--)
+                    if (stack[d - 1]->kind == want) { found = d - 1; break; }
+                if (found < depth)
+                {
+                    cur = found ? stack[found - 1] : root; /* 回到它的上一层 */
+                    depth = found;
+                }
+                p += 2;
+                continue;
+            }
+            if (c && strchr(TB_CMD_CHARS, c))
+            {
+                Tb *b = tb_new(TB_CMD);
+                if (!b) break;
+                b->cmd = (uint8_t)c;
+                if (!tb_add(cur, b)) { tb_free(b); break; }
+                p += 2;
+                continue;
+            }
+            /* 不认识的 $：当普通文字，别把玩家的文本吃掉 */
+            if (!tb_text(cur, p, 1)) break;
+            p++;
             continue;
         }
 
-        if (p[0] == '\xE2' && p[1] == '\x8C' && p[2] == '\x88') /* ⌈ */
+        if (p[0] == '%' && strncmp(p, "%NAME%", 6) == 0)
         {
-            const char *close = strstr(p + 3, "\xE2\x8C\x8B");
-            if (!close) { p += 3; continue; }
-            text_emit(p + 3, close, &color, 1, stream);
-            p = close + 3;
+            if (!tb_subst(cur, TB_NAME)) break;
+            p += 6;
             continue;
         }
-        if (p[0] == '\xE2' && p[1] == '\x8C' && p[2] == '\x8B') /* ⌋ */
+        if (p[0] == '%' && strncmp(p, "%TYPE%", 6) == 0)
         {
-            p += 3;
-            continue;
-        }
-        if (strncmp(p, "{pet}", 5) == 0)
-        {
-            const char *name = (g_pet_ctx && g_pet_ctx->name) ? g_pet_ctx->name : "它";
-            text_emit(name, name + strlen(name), &color, 3, stream);
-            p += 5;
+            if (!tb_subst(cur, TB_TYPE)) break;
+            p += 6;
             continue;
         }
 
         {
             size_t l = text_utf8_len(p);
-            int want = term ? 1 : (narrator ? 2 : 0);
-            text_emit(p, p + l, &color, want, stream);
+            if (!tb_text(cur, p, (uint32_t)l)) break;
             p += l;
         }
     }
-    text_color(&color, 0);
-    fflush(stdout);
+
+    /* 没闭合的块自动补全：内容照常播放 */
+    return root;
 }
 
-/* ---- 页面模型：§C/§F 切页 ---- */
-
-typedef struct {
-    char *text;
-    int returnable;
-    int visited;
-    int auto_enter; /* §F/§C 切出来的后续页：进入时不需要按键 */
-} TextPage;
-
-typedef struct {
-    TextPage *items;
-    uint64_t count;
-    uint64_t cap;
-} TextPages;
-
-static void text_pages_free(TextPages *ps)
-{
-    uint64_t i;
-    for (i = 0; i < ps->count; i++) free(ps->items[i].text);
-    free(ps->items);
-    ps->items = NULL;
-    ps->count = ps->cap = 0;
-}
-
-static int text_page_add(TextPages *ps, const char *s, size_t len, int returnable, int auto_enter)
-{
-    char *p = (char *)malloc(len + 1);
-    if (!p) return 0;
-    memcpy(p, s, len);
-    p[len] = '\0';
-    if (!vec_grow((void **)&ps->items, &ps->cap, ps->count + 1, sizeof(*ps->items)))
-    {
-        free(p);
-        return 0;
-    }
-    ps->items[ps->count].text = p;
-    ps->items[ps->count].returnable = returnable;
-    ps->items[ps->count].visited = 0;
-    ps->items[ps->count].auto_enter = auto_enter;
-    ps->count++;
-    return 1;
-}
-
-/* 把 pages 数组拆成文本页；§C 标当前页不可回退，§F 标可回退 */
-static int text_pages_build(const char *const *pages, uint32_t n_pages, TextPages *ps)
+/* 摊平成纯文本（选项标签 / 数值参数用）：只留可见文字，忽略格式与命令 */
+static int tb_flatten(const Tb *b, char **buf, size_t *cap, size_t *len)
 {
     uint32_t i;
-    memset(ps, 0, sizeof(*ps));
 
+    if (!b) return 1;
+    switch (b->kind)
     {
-        int pending_auto = 0; /* 上一个数组页以 §C/§F 结尾：下一页直接进入 */
-
-        for (i = 0; i < n_pages; i++)
-        {
-            const char *page = pages[i];
-            const char *start, *p;
-            int seg = 0;
-            int first_auto = pending_auto;
-
-            pending_auto = 0;
-            if (!page) continue;
-            start = page;
-            p = page;
-            while (*p)
-            {
-                int code = text_ctrl(p);
-                if (code == 'C' || code == 'F')
-                {
-                    int ret = (code == 'F');
-                    if (p > start)
-                    {
-                        if (!text_page_add(ps, start, (size_t)(p - start), ret,
-                                           seg > 0 || first_auto)) goto fail;
-                        seg++;
-                    }
-                    else if (ps->count > 0)
-                    {
-                        ps->items[ps->count - 1].returnable = ret;
-                        if (seg == 0) first_auto = 1; /* 页首/空段标记：本页直接进入 */
-                    }
-                    p += 3;
-                    start = p;
-                    if (*p == '\0') pending_auto = 1; /* 页尾标记：下一个数组页直接进入 */
-                }
-                else
-                {
-                    p += text_utf8_len(p);
-                }
-            }
-            if (p > start)
-            {
-                if (!text_page_add(ps, start, (size_t)(p - start), 1,
-                                   seg > 0 || first_auto)) goto fail;
-            }
-            else if (ps->count == 0)
-            {
-                if (!text_page_add(ps, "", 0, 1, first_auto)) goto fail;
-            }
-        }
+    case TB_TEXT: return strbuf_add(buf, cap, len, b->s, b->len);
+    case TB_NAME: return strbuf_add(buf, cap, len, text_pet_name(), strlen(text_pet_name()));
+    case TB_TYPE: return strbuf_add(buf, cap, len, text_pet_type(), strlen(text_pet_type()));
+    case TB_CMD: return 1;
+    default:
+        for (i = 0; i < b->n; i++)
+            if (!tb_flatten(b->items[i], buf, cap, len)) return 0;
+        return 1;
     }
+}
 
-    if (ps->count == 0)
-    {
-        if (!text_page_add(ps, "", 0, 1, 0)) goto fail;
-    }
+/* ---- 文本函数（$f / $F 调用，模组用 text_funcs 注册，id 从 0 开始） ---- */
+
+typedef struct {
+    int is_str;      /* 1=字符串结果 */
+    uint64_t num;    /* 数值结果 */
+    const char *str; /* 字符串结果（模组提供的只读串） */
+} TextVal;
+
+static TextFunc_t *g_text_funcs;
+static uint64_t g_text_func_n;
+static uint64_t g_text_func_cap;
+
+uint64_t modloader_text_funcs(const TextFunc_t *list, uint64_t count)
+{
+    uint64_t i;
+
+    if (!list || count == 0) return g_text_func_n;
+    if (!vec_grow((void **)&g_text_funcs, &g_text_func_cap,
+                  g_text_func_n + count, sizeof(*g_text_funcs)))
+        return UINT64_MAX;
+
+    for (i = 0; i < count; i++) g_text_funcs[g_text_func_n++] = list[i];
+    return g_text_func_n;
+}
+
+static int text_call_func(uint64_t id, TextVal *out)
+{
+    union { uint64_t num; const char *str; } v;
+    uint64_t r;
+
+    memset(out, 0, sizeof(*out));
+    if (id >= g_text_func_n || !g_text_funcs[id]) return 0;
+
+    memset(&v, 0, sizeof(v));
+    r = g_text_funcs[id](g_pet_ctx, &v);
+    if (r == 0) { out->num = v.num; return 1; }
+    if (v.str) { out->is_str = 1; out->str = v.str; return 1; }
+    out->num = r; /* 返回长度但没给串：当数字用，别丢结果 */
     return 1;
+}
 
-fail:
-    text_pages_free(ps);
+static void text_emit_val(TextCtx *c, const TextVal *v)
+{
+    char buf[32];
+
+    if (v->is_str) { text_put_str(c, v->str); return; }
+    _snprintf(buf, sizeof(buf), "%llu", (unsigned long long)v->num);
+    buf[sizeof(buf) - 1] = '\0';
+    text_put(c, buf, strlen(buf));
+}
+
+static uint64_t text_arg_num(const Tb *b)
+{
+    char *buf = NULL;
+    size_t cap = 0, len = 0;
+    uint64_t v = 0;
+
+    if (!b) return 0;
+    if (tb_flatten(b, &buf, &cap, &len) && buf) v = _strtoui64(buf, NULL, 10);
+    free(buf);
+    return v;
+}
+
+static const Tb *tb_arg(const Tb *parent, uint32_t idx)
+{
+    if (!parent || idx >= parent->n) return NULL;
+    return parent->items[idx];
+}
+
+static const Tb *tb_arg_group(const Tb *parent, uint32_t idx)
+{
+    const Tb *b = tb_arg(parent, idx);
+    if (!b) return NULL;
+    if (b->kind != TB_CONTENT && b->kind != TB_LOGIC) return NULL;
+    return b;
+}
+
+/* ---- 交互：选项菜单 / 分支 / 循环 ---- */
+
+static int text_choose(const Tb *opts, uint64_t *out)
+{
+    uint64_t i, n, cur = 0;
+    char **labels;
+    int drawn = 0, ok = 0;
+
+    if (!opts || opts->n == 0) return 0;
+    n = opts->n;
+
+    if (g_headless) { *out = 0; return 1; }
+
+    labels = (char **)calloc((size_t)n, sizeof(*labels));
+    if (!labels) return 0;
+
+    for (i = 0; i < n; i++)
+    {
+        char *buf = NULL;
+        size_t cap = 0, len = 0;
+
+        if (tb_flatten(opts->items[i], &buf, &cap, &len) && len > 0) labels[i] = buf;
+        else free(buf);
+    }
+
+    for (;;)
+    {
+        int k;
+
+        if (!drawn) printf("\n");
+        else if (g_has_vt) printf("\x1B[%uA", (unsigned)(n + 1u));
+        for (i = 0; i < n; i++)
+        {
+            if (g_has_vt) printf("\r\x1B[2K");
+            print_option_line(labels[i] ? labels[i] : "……", (int)(i == cur));
+        }
+        if (g_has_vt) printf("\r\x1B[2K");
+        printf("  ↑↓:选择   Z:确认   X:取消\n");
+        fflush(stdout);
+        drawn = 1;
+
+        k = ui_key();
+        if (k == KEY_UP) cur = (cur + n - 1) % n;
+        else if (k == KEY_DOWN) cur = (cur + 1) % n;
+        else if (k == KEY_OK) { *out = cur; ok = 1; break; }
+        else if (k == KEY_CANCEL) break;
+    }
+
+    /* 选完把选项菜单擦掉，让后续内容接着问题往下排 */
+    if (drawn && g_has_vt)
+    {
+        printf("\x1B[%uA\r\x1B[0J", (unsigned)(n + 1u));
+        fflush(stdout);
+    }
+
+    for (i = 0; i < n; i++) free(labels[i]);
+    free(labels);
+    return ok;
+}
+
+static void text_exec(TextCtx *c, const Tb *b);
+
+/* $A / $a：两个逻辑块项目数相等，选第 i 项就播放第二块的第 i 项 */
+static void text_branch(TextCtx *c, const Tb *opts, const Tb *body, int has_q, const Tb *q)
+{
+    Tb view;
+    uint64_t pick, n;
+
+    if (!opts || !body || c->ctl > 8) return;
+    if (has_q && q) text_exec(c, q);
+
+    n = opts->n;
+    if (n == 0 || body->n == 0) return;
+    if (n > body->n) n = body->n; /* 两块不等长时按短的走 */
+
+    view = *opts;
+    view.n = (uint32_t)n;
+
+    c->ctl++;
+    if (text_choose(&view, &pick) && pick < n) text_exec(c, body->items[pick]);
+    c->ctl--;
+    c->waited = 1;
+}
+
+/* $W / $w：第一块是选项（多一项=结束），选第 i 项播放第二块第 i 项后重新选 */
+static void text_loop(TextCtx *c, const Tb *opts, const Tb *body, int has_q, const Tb *q)
+{
+    uint64_t n, body_n, exit_idx, i, pick;
+    unsigned char *chosen;
+    uint32_t guard = 0;
+
+    if (!opts || !body || opts->n == 0 || c->ctl > 8) return;
+
+    n = opts->n;
+    body_n = body->n;
+    exit_idx = n - 1; /* 最后一个选项 = 结束循环 */
+
+    chosen = (unsigned char *)calloc((size_t)(body_n ? body_n : 1u), 1);
+    if (!chosen) return;
+
+    c->ctl++;
+    while (guard++ < 256)
+    {
+        if (has_q && q) text_exec(c, q);
+
+        if (g_headless)
+        {
+            /* 自检：每个选项各问一遍，都问过了就结束，避免死循环 */
+            pick = UINT64_MAX;
+            for (i = 0; i < body_n && i < exit_idx; i++)
+                if (!chosen[i]) { pick = i; break; }
+            if (pick == UINT64_MAX) break;
+        }
+        else if (!text_choose(opts, &pick))
+        {
+            break; /* X：结束循环 */
+        }
+
+        if (pick >= body_n || pick == exit_idx) break;
+        chosen[pick] = 1;
+        text_exec(c, body->items[pick]);
+    }
+    c->ctl--;
+    free(chosen);
+    c->waited = 1;
+}
+
+/* ---- 命令 ---- */
+
+/* 执行一条命令，返回它消费掉的参数块个数（参数就是后面紧跟的那些块） */
+static uint32_t text_cmd(TextCtx *c, const Tb *cmd, const Tb *parent, uint32_t arg)
+{
+    switch (cmd->cmd)
+    {
+    case 'X': c->skip_x = 1; return 0;
+    case 'x': c->skip_x = 0; return 0;
+    case 'S': c->stream = 1; return 0;
+    case 's': c->stream = 0; return 0;
+    case 'K': c->kw = 1; return 0;
+    case 'k': c->kw = 0; kw_flush(); return 0;
+    case 'N': c->nm = 1; return 0;
+    case 'n': c->nm = 0; return 0;
+    case 'E': c->snk = 1; return 0;
+    case 'e': c->snk = 0; return 0;
+    case 'L': /* 逻辑换行：另起一条逻辑行，$c 只清这一条 */
+        kw_flush();
+        printf("\n");
+        c->vis_lines = 0;
+        fflush(stdout);
+        return 0;
+    case 'C': text_clear_screen(c); return 0;
+    case 'c': text_clear_line(c); return 0;
+    case 'P': text_wait_key(c); return 0;
+    case 'p':
+    {
+        const Tb *a = tb_arg_group(parent, arg);
+        if (!a) return 0;
+        text_sleep_ms(text_arg_num(a));
+        c->waited = 1;
+        return 1;
+    }
+    case 'A':
+    {
+        const Tb *opts = tb_arg_group(parent, arg);
+        const Tb *body = tb_arg_group(parent, arg + 1u);
+        if (!opts || !body) return 0;
+        text_branch(c, opts, body, 0, NULL);
+        return 2;
+    }
+    case 'a':
+    {
+        const Tb *q = tb_arg_group(parent, arg);
+        const Tb *opts = tb_arg_group(parent, arg + 1u);
+        const Tb *body = tb_arg_group(parent, arg + 2u);
+        if (!q || !opts || !body) return 0;
+        text_branch(c, opts, body, 1, q);
+        return 3;
+    }
+    case 'W':
+    {
+        const Tb *opts = tb_arg_group(parent, arg);
+        const Tb *body = tb_arg_group(parent, arg + 1u);
+        if (!opts || !body) return 0;
+        text_loop(c, opts, body, 0, NULL);
+        return 2;
+    }
+    case 'w':
+    {
+        const Tb *q = tb_arg_group(parent, arg);
+        const Tb *opts = tb_arg_group(parent, arg + 1u);
+        const Tb *body = tb_arg_group(parent, arg + 2u);
+        if (!q || !opts || !body) return 0;
+        text_loop(c, opts, body, 1, q);
+        return 3;
+    }
+    case 'F':
+    {
+        const Tb *a = tb_arg_group(parent, arg);
+        const Tb *body = tb_arg_group(parent, arg + 1u);
+        TextVal v;
+
+        if (!a || !body) return 0;
+        if (text_call_func(text_arg_num(a), &v) && body->n > 0)
+        {
+            uint64_t idx = v.is_str ? (uint64_t)strlen(v.str) : v.num;
+            idx %= body->n; /* 返回值超过项目数：取模循环 */
+            text_exec(c, body->items[idx]);
+        }
+        return 2;
+    }
+    case 'f':
+    {
+        const Tb *a = tb_arg_group(parent, arg);
+        TextVal v;
+
+        if (!a) return 0;
+        if (text_call_func(text_arg_num(a), &v)) text_emit_val(c, &v);
+        return 1;
+    }
+    default:
+        break;
+    }
     return 0;
 }
 
-static uint64_t text_pages_prev(const TextPages *ps, uint64_t cur)
+static void text_exec_items(TextCtx *c, const Tb *b)
 {
-    uint64_t j = cur;
-    while (j > 0)
+    uint32_t i = 0;
+
+    if (!b) return;
+    while (i < b->n)
     {
-        j--;
-        if (ps->items[j].returnable) return j;
+        const Tb *it = b->items[i];
+
+        if (it->kind == TB_CMD)
+        {
+            i += 1u + text_cmd(c, it, b, i + 1u);
+            continue;
+        }
+        text_exec(c, it);
+        i++;
     }
-    return UINT64_MAX;
 }
 
-static uint64_t text_pages_next(const TextPages *ps, uint64_t cur)
+static void text_exec(TextCtx *c, const Tb *b)
 {
-    uint64_t j = cur + 1;
-    while (j < ps->count)
+    if (!b || c->depth > TB_MAX_DEPTH) return;
+
+    switch (b->kind)
     {
-        if (ps->items[j].returnable || !ps->items[j].visited) return j;
-        j++;
+    case TB_TEXT: text_put(c, b->s, b->len); break;
+    case TB_NAME: text_put_str(c, text_pet_name()); break;
+    case TB_TYPE: text_put_str(c, text_pet_type()); break;
+    case TB_CMD: text_cmd(c, b, NULL, 0); break;
+    default:
+        c->depth++;
+        text_exec_items(c, b);
+        c->depth--;
+        break;
     }
-    return UINT64_MAX;
+}
+
+/* ---- 入口 ---- */
+
+static uint32_t text_stream_ms(void)
+{
+    int32_t v;
+
+    if (reg_find(KIND_CONFIG, "text.stream_ms") == ID_NONE) return 30;
+    v = cfg_get("text.stream_ms");
+    if (v < 0) v = 0;
+    if (v > 1000) v = 1000;
+    return (uint32_t)v;
+}
+
+static void text_reset(TextCtx *c)
+{
+    c->kw = c->nm = c->snk = 0;
+    c->skip_now = 0;
+    kw_flush();
+    text_style(c, TEXT_STYLE_NONE);
+    fflush(stdout);
+}
+
+/* 普通输出：默认不流式，不含术语收集（$C / $P 照样能用） */
+static void text_engine_run(const char *text, int stream_default)
+{
+    TextCtx ctx;
+    Tb *root;
+
+    if (!text || !text[0]) return;
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.stream = stream_default ? 1 : 0;
+    ctx.skip_x = 1;
+    ctx.stream_ms = text_stream_ms();
+    g_push_key = 0;
+
+    root = tb_parse(text);
+    if (root)
+    {
+        text_exec_items(&ctx, root);
+        tb_free(root);
+    }
+    text_reset(&ctx);
 }
 
 static int ui_dialog(const char *speaker, const char *const *pages, uint32_t n_pages,
                      const StoryOpt_t *opts, uint32_t n_opts)
 {
+    TextCtx ctx;
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.speaker = speaker;
+    ctx.stream = 1;  /* 对话默认流式输出（$s 关） */
+    ctx.skip_x = 1;  /* 流式输出时 X 可跳过（$x 关） */
+    ctx.collect = 1; /* $K 关键词进术语表，C 键查解释 */
+    ctx.stream_ms = text_stream_ms();
+    g_push_key = 0;
+
     if (pages && n_pages > 0)
     {
-        TextPages ps;
+        uint32_t i;
 
-        if (text_pages_build(pages, n_pages, &ps))
+        ui_title(speaker ? speaker : "");
+        for (i = 0; i < n_pages; i++)
         {
-            uint64_t cur = 0;
-            int auto_run = 1; /* 初始/§F/§C 自动前进；用户按键后停下 */
+            Tb *root;
 
-            while (1)
+            if (!pages[i]) continue;
+
+            terms_clear();
+            ctx.waited = 0;
+            ctx.skip_now = 0;
+            ctx.depth = 0;
+            ctx.ctl = 0;
+            ctx.emitted = 0;
+            ctx.vis_lines = 0;
+
+            root = tb_parse(pages[i]);
+            if (root)
             {
-                int k;
-                uint64_t prev = text_pages_prev(&ps, cur);
-                uint64_t next = text_pages_next(&ps, cur);
-
-                ps.items[cur].visited = 1;
-                ui_title(speaker ? speaker : "");
-                printf("\n");
-                render_text(ps.items[cur].text);
-                collect_terms(ps.items[cur].text);
-                printf("\n\n");
-
-                /* §F/§C 切出来的后续页直接显示，不等待按键 */
-                if (auto_run && next != UINT64_MAX && ps.items[next].auto_enter)
-                {
-                    cur = next;
-                    continue;
-                }
-
-                if (prev != UINT64_MAX) printf("  ←:上页");
-                if (next != UINT64_MAX) printf("  →:下页");
-                else if (n_opts > 0) printf("  Z:选项");
-                else printf("  Z:继续");
-                if (g_page_term_n > 0) printf("  C:术语");
-                printf("  X:跳过\n");
-                fflush(stdout);
-
-                k = ui_key();
-                if (k == KEY_LEFT && prev != UINT64_MAX) { cur = prev; auto_run = 0; continue; }
-                if (k == KEY_RIGHT && next != UINT64_MAX) { cur = next; auto_run = 1; continue; }
-                if (k == KEY_TERM && g_page_term_n > 0) { show_terms(); continue; }
-                if (k == KEY_OK && next != UINT64_MAX) { cur = next; auto_run = 1; continue; }
-                if (k == KEY_OK || k == KEY_CANCEL) break;
+                text_exec_items(&ctx, root);
+                tb_free(root);
             }
-            text_pages_free(&ps);
+            text_reset(&ctx);
+
+            /* 这一页自己没等过键：补一次 Z，没写 $P 的文本照样会停 */
+            if (!g_headless && !ctx.waited && ctx.emitted > 0)
+            {
+                printf("\n");
+                text_wait_key(&ctx);
+            }
         }
+        text_reset(&ctx);
     }
 
     if (!opts || n_opts == 0) return 0;
@@ -1419,7 +2014,11 @@ static int svc_menu_run(Pet *pet, const char *parent)
     MenuRef *refs;
     SelectOpt_t *opts;
     uint64_t n = 0, i, back = 0, total;
+    char step[256];
     int sel;
+
+    /* 菜单里的文本（dialog / ui_print）要用 %NAME%，先把当前宠物交给文字引擎 */
+    if (pet) g_pet_ctx = pet;
 
     refs = menu_collect(parent, &n);
     if (n == 0)
@@ -1453,7 +2052,10 @@ static int svc_menu_run(Pet *pet, const char *parent)
         back = 1;
     }
 
-    sel = ui_menu(parent ? parent : "主菜单", opts, n + back);
+    /* 步骤键：主菜单一条，每个子菜单一条；menu name 全局唯一，所以层数不限 */
+    _snprintf(step, sizeof(step), "menu.%s", parent ? parent : "@root");
+    step[sizeof(step) - 1] = '\0';
+    sel = ui_menu_step(parent ? parent : "主菜单", step, opts, n + back);
     free(opts); /* 文本已被 ui_menu 释放 */
     if (sel <= 0 || (uint64_t)sel > n)
     {
@@ -1472,6 +2074,23 @@ static int svc_menu_run(Pet *pet, const char *parent)
         if (m->flags & MENU_FLAG_EXIT) return -1;
         if (m->run)
         {
+            /* 页面型菜单（MENU_FLAG_STAY）：回调返回 1 表示“还在这一页”，
+             * 重新调一次把它画出来；返回 0 才离开本页（父菜单重画）。
+             * 商场/医院就是这种购买页：买完留在本页，按 X / 选“返回”才回“出门”。
+             * 无头自检不循环（否则第一项会被一直执行）；1000 次只是保险，
+             * 防止没有控制台时 _getch 一直返回“确认”而在这儿转死。 */
+            if ((m->flags & MENU_FLAG_STAY) && !g_headless)
+            {
+                uint32_t guard;
+
+                for (guard = 0; guard < 1000; guard++)
+                {
+                    r = m->run(pet);
+                    if (r < 0) return -1;
+                    if (r == 0) break;
+                }
+                return 1; /* 页面结束：回上一级列表（父菜单重画） */
+            }
             r = m->run(pet);
             if (r < 0) return -1;
             if (r == 0) return 0;
@@ -1516,6 +2135,7 @@ static int svc_key_poll(void)
 {
     int c;
 
+    if (g_push_key) { int k = g_push_key; g_push_key = 0; return k; }
     if (g_headless) return KEY_OK; /* 自检：模拟一直按确认键 */
     if (!_kbhit()) return 0;
 
@@ -1531,6 +2151,7 @@ static Id svc_inv_pick(Pet *pet, ItemType_t type, const char *title)
     SelectOpt_t *opts;
     Id *ids;
     uint64_t cnt = 0, i;
+    char step[96];
     int sel;
 
     if (!pet) return ID_NONE;
@@ -1573,7 +2194,11 @@ static Id svc_inv_pick(Pet *pet, ItemType_t type, const char *title)
         cnt++;
     }
 
-    sel = ui_menu(title, opts, cnt);
+    /* 同一个标题可能给不同类别的物品共用（例如“选礼物”先食物后清洁用品），
+     * 步骤键带上类别，两个列表分开记 */
+    _snprintf(step, sizeof(step), "inv.%d.%s", (int)type, title ? title : "");
+    step[sizeof(step) - 1] = '\0';
+    sel = ui_menu_step(title, step, opts, cnt);
     {
         Id picked = (sel < 0 || (uint64_t)sel >= cnt) ? ID_NONE : ids[sel];
         free(opts); /* 文本已被 ui_menu 释放 */
@@ -1932,7 +2557,8 @@ static int svc_trait_shop(Pet *pet, const char *title, int allow_delete,
         opts[n].value = 0;
         n++;
 
-        sel = ui_menu(head, opts, (uint64_t)n);
+        /* head 里有鲁尼和特质，会变；用固定标题当步骤键 */
+        sel = ui_menu_step(head, title, opts, (uint64_t)n);
         if (sel <= 0) return 1;
 
         if (sel == 1)
@@ -3932,6 +4558,7 @@ uint64_t modloader_init(const char *mods_dir)
     g_api.ui_option = ui_option;
     g_api.name_pick = svc_name_pick;
     g_api.trait_shop = svc_trait_shop;
+    g_api.text_funcs = modloader_text_funcs;
 
     pattern_len = strlen(mods_dir) + 8;
     pattern = (char *)malloc(pattern_len);
@@ -3997,6 +4624,13 @@ void modloader_shutdown(void)
 
     err_rollback(0); /* 错误表里的字符串也是堆内存 */
     terms_free();
+    steps_free();
+    free(g_text_funcs);
+    g_text_funcs = NULL;
+    g_text_func_n = g_text_func_cap = 0;
+    free(g_kw);
+    g_kw = NULL;
+    g_kw_n = g_kw_cap = 0;
     bs_free(&g_ach_all);
     free(g_errors);
     g_errors = NULL;

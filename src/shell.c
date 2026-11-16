@@ -209,9 +209,14 @@ static int sys_config(Pet *pet)
     }
 }
 
-/* 配置是宿主自带的：其中 ui.page_size 是滑动条，决定所有菜单每页几项 */
+/*
+ * 配置是宿主自带的：
+ *   ui.page_size   滑动条，决定所有菜单每页几项；
+ *   text.stream_ms 滑动条，文本引擎流式输出每字多少毫秒（0 = 不流式）。
+ */
 static const Config_t SYSTEM_CONFIGS[] = {
-    {"ui.page_size", "每页菜单项数", "主菜单/子菜单每页显示的行数（1~16）", CFG_SLIDER, 4, 1, 16}
+    {"ui.page_size", "每页菜单项数", "主菜单/子菜单每页显示的行数（1~16）", CFG_SLIDER, 4, 1, 16},
+    {"text.stream_ms", "流式输出延时", "文本逐字输出的每字毫秒数（0=不流式）", CFG_SLIDER, 30, 0, 120}
 };
 
 static const Menu_t SYSTEM_MENUS[] = {

@@ -249,11 +249,15 @@ typedef struct {
     int value;        /* 选项值 */
 } StoryOpt_t;
 
-/* 一段对话：pages 里可用 {pet} 占位当前宠物名，由引擎替换 */
+/*
+ * 一段对话：pages 里可用 %NAME% 占位当前宠物名、%TYPE% 占位宠物种类，由引擎替换。
+ * 每个元素是一段文本，按顺序播放；节奏用格式符控制（$L 逻辑换行、$C 清屏、$P 等 Z、$p 停顿）。
+ * 文本里的 \n 只是同一逻辑行里的普通换行，$c 清行时会把整条逻辑行（含这些 \n）一起清掉。
+ */
 typedef struct {
     const char *npc;          /* NULL=通用；否则只在当前 NPC 是该角色时播放 */
     const char *speaker;      /* 说话人显示名 */
-    const char *const *pages; /* 分页文本，每元素一屏 */
+    const char *const *pages; /* 顺序播放的文本段 */
     uint32_t page_count;
 } Dialog_t;
 
@@ -325,6 +329,7 @@ typedef struct {
 
 #define MENU_FLAG_NONE 0u
 #define MENU_FLAG_EXIT 1u /* 选中后结束游戏（“退出”） */
+#define MENU_FLAG_STAY 2u /* 页面型：回调返回 1 留在本页重画，返回 0 才回上一级 */
 
 /* ==== 配置 ==== */
 
@@ -358,11 +363,20 @@ typedef struct {
 
 /* ==== 文本 / 界面数据 ==== */
 
-/* 术语条目（⌈术语⌋ 高亮 + B键解释） */
+/* 术语条目（文本里 $K词$k 高亮，对话里按 C 键查解释） */
 typedef struct {
     const char *name;
     const char *desc;
 } TermDef_t;
+
+/*
+ * 文本函数：文本引擎的 $f / $F 用（模组用 LoaderApi.text_funcs 注册，id 从 0 开始）。
+ * ret 是引擎给的结果缓冲区，约定：
+ *   返回 0   → 结果是数字，写在 *(uint64_t *)ret 里；
+ *   返回 >0  → 结果是长度为该返回值的 UTF-8 串，指针写在 *(const char **)ret 里。
+ * $f!T 把结果当文本插入；$F!T!L 把结果当逻辑块 L 的项目下标（超出项目数就取模）。
+ */
+typedef uint64_t (*TextFunc_t)(Pet *pet, void *ret);
 
 /*
  * 菜单文本：16 字节的带标记字符串。

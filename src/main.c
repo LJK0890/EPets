@@ -130,8 +130,8 @@ static int choose_gender(Gender_t *out)
 static int rebirth_pick_species(Id *type_id, Gender_t *gender, uint32_t *coins)
 {
     static const char *const PAGES[] = {
-        "§O桥屋向导§0：§S又见面了。上一只伴兽已经不在了。§0",
-        "§O桥屋向导§0：§S先定下种类和性别吧。§0"
+        "$C$N桥屋向导$n ：又见面了。$L上一只伴兽已经不在了。$P",
+        "$C$N桥屋向导$n ：先定下种类和性别吧。$P"
     };
     static const StoryOpt_t OPTS[] = {
         {"随机（免费）", 1},
@@ -152,7 +152,7 @@ static int rebirth_pick_species(Id *type_id, Gender_t *gender, uint32_t *coins)
         }
         if (*coins < REBIRTH_SPECIES_COST)
         {
-            ml_api()->ui_err("  鲁尼不够：自选需要 %u 鲁尼", REBIRTH_SPECIES_COST);
+            ml_api()->ui_err("鲁尼不够：自选需要 %u 鲁尼", REBIRTH_SPECIES_COST);
             ml_key();
             continue;
         }
@@ -167,7 +167,7 @@ static int rebirth_pick_species(Id *type_id, Gender_t *gender, uint32_t *coins)
 static int rebirth_pick_name(Gender_t gender, const char **name, uint32_t *coins)
 {
     static const char *const PAGES[] = {
-        "§O桥屋向导§0：§S再给它取个名字吧。§0"
+        "$C$N桥屋向导$n ：再给它取个名字吧。$P"
     };
     static const StoryOpt_t OPTS[] = {
         {"随机名字（免费）", 1},
@@ -187,7 +187,7 @@ static int rebirth_pick_name(Gender_t gender, const char **name, uint32_t *coins
         }
         if (*coins < REBIRTH_NAME_COST)
         {
-            ml_api()->ui_err("  鲁尼不够：选取名字需要 %u 鲁尼", REBIRTH_NAME_COST);
+            ml_api()->ui_err("鲁尼不够：选取名字需要 %u 鲁尼", REBIRTH_NAME_COST);
             ml_key();
             continue;
         }

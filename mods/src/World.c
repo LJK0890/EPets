@@ -72,17 +72,17 @@ static int menu_shop(Pet *pet)
     {
         g_api->ui_print("\n货架是空的\n");
         pause_key();
-        return 1;
+        return 0;
     }
 
-    opts = (SelectOpt_t *)calloc((size_t)total, sizeof(*opts));
+    opts = (SelectOpt_t *)calloc((size_t)(total + 1), sizeof(*opts));
     ids = (Id *)malloc((size_t)total * sizeof(*ids));
     if (!opts || !ids)
     {
         free(opts);
         free(ids);
         g_api->ui_print("\n商品列表分配失败\n");
-        return 1;
+        return 0;
     }
 
     for (i = 1; i <= total; i++)
@@ -101,38 +101,41 @@ static int menu_shop(Pet *pet)
         free(ids);
         g_api->ui_print("\n货架是空的\n");
         pause_key();
-        return 1;
+        return 0;
     }
 
-    g_api->ui_print("\n  当前鲁尼：%u\n", pet->coins);
-    sel = g_api->ui_menu("商场", opts, n);
+    /* 购买页（MENU_FLAG_STAY）：买完留在这一页，按 X 或选“返回”才回“出门” */
+    g_api->opt_text(&opts[n], "返回（鲁尼 %u）", pet->coins);
+    opts[n].value = -1;
+
+    sel = g_api->ui_menu("商场", opts, n + 1);
     free(opts);
     if (sel < 0 || (uint64_t)sel >= n)
     {
         free(ids);
-        return 1;
+        return 0; /* 离开商场页面 */
     }
     picked = ids[sel];
     free(ids);
 
     {
         const Item *it = (const Item *)g_api->get(KIND_ITEM, picked);
-        if (!it) return 1;
+        if (!it) return 0;
         if (pet->coins < it->price)
         {
-            g_api->ui_err("  鲁尼不够");
+            g_api->ui_err("  鲁尼不够：还差 %u", it->price - pet->coins);
             pause_key();
-            return 1;
+            return 1; /* 留在本页，可以换一样买 */
         }
         pet->coins -= it->price;
         g_api->inv_add(pet, picked, 1);
         if (it->price > pet->big_spend) pet->big_spend = it->price;
-        g_api->ui_ok("  买下了 %s（-%u）", it->name, it->price);
+        g_api->ui_ok("  买下了 %s（-%u），剩余 %u 鲁尼", it->name, it->price, pet->coins);
         g_api->ach_poll(pet);
         g_api->save(pet);
         pause_key();
     }
-    return 1;
+    return 1; /* 留在商场页面 */
 }
 
 /* ============ 医院 ============ */
@@ -143,33 +146,34 @@ static int menu_hospital(Pet *pet)
     int sel;
 
     memset(opts, 0, sizeof(opts));
-    g_api->opt_text(&opts[0], "治疗"); opts[0].value = 1;
-    g_api->opt_text(&opts[1], "算了"); opts[1].value = 0;
+    g_api->opt_text(&opts[0], "治疗（200 鲁尼）"); opts[0].value = 1;
+    g_api->opt_text(&opts[1], "离开（健康 %u · 鲁尼 %u）", pet->health, pet->coins);
+    opts[1].value = 0;
 
     (void)g_api->story_play(pet, "hospital", NULL);
 
-    g_api->ui_title("医院");
-    g_api->ui_print("\n  治疗一次 200 鲁尼\n");
-    g_api->ui_print("  当前：健康 %u%s\n", pet->health,
-                    pet->sick != D_NONE ? "（生病）" : "");
-
     if (pet->coins < 200)
     {
+        g_api->ui_title("医院");
+        g_api->ui_print("\n  治疗一次 200 鲁尼\n");
+        g_api->ui_print("  当前：健康 %u%s\n", pet->health,
+                        pet->sick != D_NONE ? "（生病）" : "");
         g_api->ui_err("  鲁尼不够");
         pause_key();
-        return 1;
+        return 0;
     }
 
+    /* 购买页（MENU_FLAG_STAY）：治完留在这一页，选“离开”才回“出门” */
     sel = g_api->ui_menu("要治吗？", opts, 2);
-    if (sel != 1) return 1;
+    if (sel != 1) return 0;
 
     pet->coins -= 200;
     pet->sick = D_NONE;
     pet->health = add_stat(pet->health, 40);
-    g_api->ui_ok("  治好了，健康 %u", pet->health);
+    g_api->ui_ok("  治好了，健康 %u，剩余 %u 鲁尼", pet->health, pet->coins);
     g_api->save(pet);
     pause_key();
-    return 1;
+    return 1; /* 留在医院页面 */
 }
 
 /* ============ 公园 ============ */
@@ -300,8 +304,8 @@ static int menu_travel(Pet *pet)
 
 static const Menu_t MENUS[] = {
     {"出门",     "出门",         0,       60, MENU_FLAG_NONE, 0},
-    {"商场",     "商场",         "出门",  10, MENU_FLAG_NONE, menu_shop},
-    {"医院",     "医院",         "出门",  20, MENU_FLAG_NONE, menu_hospital},
+    {"商场",     "商场",         "出门",  10, MENU_FLAG_STAY, menu_shop},
+    {"医院",     "医院",         "出门",  20, MENU_FLAG_STAY, menu_hospital},
     {"公园",     "公园",         "出门",  30, MENU_FLAG_NONE, menu_park},
     {"游乐园",   "游乐园",       "出门",  40, MENU_FLAG_NONE, menu_amuse},
     {"出远门",   "出远门",       "出门",  50, MENU_FLAG_NONE, menu_travel},

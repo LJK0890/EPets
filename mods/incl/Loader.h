@@ -20,7 +20,7 @@
  * 字符串一律由模组提供并放在只读段，加载器只保存指针，不复制。
  */
 
-#define LOADER_API_VERSION 10u /* 接口版本，不一致则拒绝加载模组 */
+#define LOADER_API_VERSION 11u /* 接口版本，不一致则拒绝加载模组 */
 
 /* ==== 内容种类（引擎固定，不是内容 Id） ==== */
 
@@ -40,7 +40,7 @@ typedef enum {
 } ContentKind_t;
 
 /* ==== 按键编码 ==== */
-/* 上下方向键选择，Z 确认，X 返回/取消；T 在对话里查术语 */
+/* 上下方向键选择，Z 确认，X 返回/取消；C 在对话里查术语（$K 标出的关键词） */
 #define KEY_UP     1
 #define KEY_DOWN   2
 #define KEY_OK     3
@@ -85,13 +85,17 @@ typedef struct LoaderApi {
     void (*ui_ok)(const char *fmt, ...);   /* 绿色成功消息 */
     void (*ui_err)(const char *fmt, ...);  /* 红色错误消息 */
     void (*ui_warn)(const char *fmt, ...); /* 黄色警告消息 */
-    /* 选择菜单：↑↓ 选择，Z 确认，X 返回；返回选中 value，X 返回 -1 */
+    /* 选择菜单：↑↓ 选择，Z 确认，X 返回；返回选中 value，X 返回 -1。
+     * 按 header 记住上次停留的项：下次进入同一标题的列表时从原位开始。 */
     int (*ui_menu)(const char *header, SelectOpt_t *opts, uint64_t count);
     /* 写入菜单选项文本：<=14 字节内联，更长自动动态分配；ui_menu 消费后释放 */
     void (*opt_text)(SelectOpt_t *opt, const char *fmt, ...);
     int (*key)(void);           /* 阻塞读键：返回 KEY_*（↑↓ Z X C ← →） */
     void (*delay)(uint32_t ms); /* 停顿 */
-    /* 分页对话 + 可选选项；返回选项 value，无选项/取消返回 0 */
+    /* 对话 + 可选选项；返回选项 value，无选项/取消返回 0。
+     * pages 按顺序播放（没有翻页）：节奏靠文本里的格式符控制，
+     *   $L 逻辑换行   $C 清屏   $c 清当前逻辑行   $P 等 Z   $p!T 等 T 毫秒
+     * 一页播完若文本自己没等过键，引擎会补一次 Z 等待。 */
     int (*dialog)(const char *speaker, const char *const *pages, uint32_t n_pages,
                   const StoryOpt_t *opts, uint32_t n_opts);
 
@@ -149,6 +153,14 @@ typedef struct LoaderApi {
      * 价钱从 pet->coins 扣；没得加 / 钱不够只提示，不扣钱。返回 1=已处理。 */
     int (*trait_shop)(Pet *pet, const char *title, int allow_delete,
                       uint32_t cost_random, uint32_t cost_pick, uint32_t cost_delete);
+
+    /* ---- 文本函数（文本引擎的 $f / $F 调用） ---- */
+    /* 注册一组文本函数：id 从 0 开始按注册顺序编号，可以多次调用追加。
+     * 每个函数是 TextFunc_t（见 Defineds.h）：
+     *   返回 0  → 结果数字写在 *(uint64_t *)ret；
+     *   返回 >0 → 结果是长度为该返回值的 UTF-8 串，指针写在 *(const char **)ret。
+     * 返回注册后的函数总数；失败返回 UINT64_MAX。 */
+    uint64_t (*text_funcs)(const TextFunc_t *list, uint64_t count);
 } LoaderApi;
 
 /* ==== 模组侧便捷宏 ==== */
@@ -171,7 +183,7 @@ typedef struct LoaderApi {
 
 /* ==== 模组导出约定 ==== */
 
-#define MOD_API_VERSION 10u /* 模组要求的最低接口版本 */
+#define MOD_API_VERSION 11u /* 模组要求的最低接口版本 */
 
 /* 模组信息：加载器先读它，再决定要不要调用 mod_init */
 typedef struct {

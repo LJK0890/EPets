@@ -421,8 +421,8 @@ static int menu_center(Pet *pet)
 static int menu_rename(Pet *pet)
 {
     static const char *const PAGES[] = {
-        "  §S§O祭坛§0§S：想给它换个名字？§0",
-        "  §S§O祭坛§0§S：名字会跟它一辈子，想好了再改。§0"
+        "  $C$N祭坛$n ：想给它换个名字？$P",
+        "  $C$N祭坛$n ：名字会跟它一辈子，想好了再改。$P"
     };
     static const StoryOpt_t OPTS[] = {
         {"随机名字（500 鲁尼）", 1},

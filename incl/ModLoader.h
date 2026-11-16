@@ -60,6 +60,8 @@ ML_API const char *modloader_name_at(Gender_t gender, uint64_t index);
 
 /* 渲染 parent 的子菜单并执行选中项（parent=NULL 为主菜单）。
  * 返回 1=已处理（继续），0=返回上一级，-1=请求退出游戏。
+ * 每层菜单会记住上次停留的位置（键是父菜单名，主菜单用 @root），
+ * 退出后再进入仍停在原处，嵌套层数不限。
  * 主程序只调用这一项，具体菜单项由模组用 KIND_MENU 注册。 */
 ML_API int modloader_menu_run(Pet *pet, const char *parent);
 
