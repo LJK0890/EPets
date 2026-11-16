@@ -44,6 +44,7 @@ CMakeUserPresets.json
 
 # 数据文件
 *.sav
+*.dat
 
 # 系统文件
 .DS_Store
